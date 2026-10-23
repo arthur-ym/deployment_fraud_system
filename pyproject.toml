@@ -1,22 +1,18 @@
-
 [project]
 name = "deployment-fraud-system"
 version = "0.1.0"
-description = "Fraud detection model deployment API"
-readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi",
-    "mlflow==3.16.1",
+    "uvicorn[standard]>=0.22.0",
+    "joblib",
     "numpy==2.5.3",
-    "pandas==3.0.6",
-    "psutil==7.2.2",
-    "ruff>=0.17.2",
-    "scikit-learn==1.9.1",
-    "scipy==1.18.1",
-    "uvicorn[standard]",
     "xgboost==3.4.1",
+    "requests>=2.34.2",
 ]
 
-[tool.uv]
-package = false
+[dependency-groups]
+dev = [
+    "ruff>=0.17.2",
+    "pytest",
+]

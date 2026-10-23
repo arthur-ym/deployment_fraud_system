@@ -1,56 +1,64 @@
 """
-This module implements a Flask application that serves a machine learning model for predictions.
-The application loads a pre-trained linear regression model and provides an endpoint to make predictions
-based on input data sent via POST requests.
+FastAPI app to serve a machine-learning model for predictions.
 
-The model is expected to be saved in a file named "linear_model.pkl".
+This module loads a model from "artifacts/model.ubj" (relative to the project root)
+and exposes a /predict endpoint that accepts JSON {"X": [values]} and returns predictions.
 """
 
-from flask import Flask, request, jsonify  
-import joblib  
-import numpy as np 
+from typing import List
 import os
+import joblib
+import numpy as np
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
 
-# Initialize the Flask application
-app = Flask(__name__)
+# Determine model path relative to this file:
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+MODEL_PATH = os.path.join(ROOT, "artifacts", "model.ubj")
 
-# Load the trained model saved in the file "linear_model.pkl"
-model = joblib.load("linear_model.pkl")
+model = None
 
-@app.route("/predict", methods=["POST"])
-def predict():
-    """
-    Handle POST requests to the "/predict" endpoint.
-
-    This function receives input data in JSON format, processes it, and uses the loaded
-    machine learning model to make predictions. The predictions are returned in JSON format.
-
-    Returns:
-        Response: A JSON response containing the predictions or an error message.
-    """
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan handler: load model on startup."""
+    global model
+    if not os.path.exists(MODEL_PATH):
+        raise RuntimeError(f"Model file not found at: {MODEL_PATH}")
     try:
-        # Get the data sent in the request in JSON format
-        data = request.get_json()
+        model = joblib.load(MODEL_PATH)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to load model from {MODEL_PATH}: {exc}") from exc
+    try:
+        yield
+    finally:
+        # optional cleanup
+        model = None
 
-        # Convert the received data into a NumPy array and format it as a column matrix
-        X_new = np.array(data["X"]).reshape(-1, 1)
+app = FastAPI(title="Deployment Fraud System - Inference", lifespan=lifespan)
 
-        # Make predictions using the loaded model and convert the result to a list
-        prediction = model.predict(X_new).tolist()
+class PredictRequest(BaseModel):
+    X: List[float]
 
-        # Return the prediction in JSON format
-        return jsonify({"prediction": prediction})
-    
-    except Exception as e:
-        # Return an error if there is an issue processing the request
-        return jsonify({"error": str(e)})
+@app.get("/")
+def health() -> dict:
+    return {"status": "ok", "model_loaded": model is not None}
+
+@app.post("/predict")
+def predict(req: PredictRequest) -> dict:
+    if model is None:
+        raise HTTPException(status_code=500, detail="Model not loaded")
+    try:
+        X = np.array(req.X).reshape(-1, 1)
+        preds = model.predict(X)
+        return {"prediction": preds.tolist()}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
 
 if __name__ == "__main__":
-    """
-    Start the Flask server.
+    # Run with: python src/inference.py
+    import uvicorn
 
-    The server listens on the port specified in the "PORT" environment variable (default: 5000)
-    and binds to all available network interfaces (host: "0.0.0.0").
-    """
-    port = int(os.environ.get("PORT", 5000))  # Get the port from the environment in Heroku
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
