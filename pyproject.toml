@@ -1,19 +1,22 @@
+
 [project]
 name = "deployment-fraud-system"
 version = "0.1.0"
-description = "Add your description here"
+description = "Fraud detection model deployment API"
 readme = "README.md"
-authors = [
-    { name = "Arthur YM", email = "arthuryamamoto25@gmail.com" }
-]
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi",
+    "mlflow==3.16.1",
+    "numpy==2.5.3",
+    "pandas==3.0.6",
+    "psutil==7.2.2",
     "ruff>=0.17.2",
+    "scikit-learn==1.9.1",
+    "scipy==1.18.1",
+    "uvicorn[standard]",
+    "xgboost==3.4.1",
 ]
 
-[project.scripts]
-deployment-fraud-system = "deployment_fraud_system:main"
-
-[build-system]
-requires = ["uv_build>=0.12.17,<0.13.0"]
-build-backend = "uv_build"
+[tool.uv]
+package = false
