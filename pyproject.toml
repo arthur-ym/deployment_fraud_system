@@ -9,6 +9,7 @@ dependencies = [
     "numpy==2.5.3",
     "xgboost==3.4.1",
     "requests>=2.34.2",
+    "scikit-learn>=1.9.1",
 ]
 
 [dependency-groups]

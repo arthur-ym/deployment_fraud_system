@@ -53,7 +53,7 @@ app = FastAPI(
 
 
 class PredictRequest(BaseModel):
-    X: List[float]
+    X: List
 
 
 @app.get("/")
@@ -73,7 +73,7 @@ def predict(req: PredictRequest) -> dict:
 
     try:
         X = np.array(req.X, dtype=float).reshape(1, -1)
-        preds = model.predict(X)
+        preds = model.predict_proba(X)[0, 1]
 
         return {"prediction": preds.tolist()}
 

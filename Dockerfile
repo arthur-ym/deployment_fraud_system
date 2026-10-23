@@ -20,7 +20,7 @@ RUN uv sync --locked --no-dev --no-install-project
 
 # Copy source code and model artifacts
 COPY src/ ./src/
-COPY artifacts/ ./artifacts/
+COPY artifacts/model.ubj ./artifacts/model.ubj
 
 # Make the virtual environment available
 ENV PATH="/app/.venv/bin:$PATH"
