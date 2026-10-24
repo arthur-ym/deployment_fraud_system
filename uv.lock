@@ -362,7 +362,7 @@ dev = [
     { name = "pip", specifier = ">=26.2.2" },
     { name = "pre-commit", specifier = ">=4.7.0" },
     { name = "pytest" },
-    { name = "ruff", specifier = ">=0.17.2" },
+    { name = "ruff", specifier = "==0.17.2" },
 ]
 
 [[package]]
