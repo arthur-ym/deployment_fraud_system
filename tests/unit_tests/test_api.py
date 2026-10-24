@@ -18,7 +18,7 @@ def test_prediction_is_probability(client, payloads):
         json={"X": payloads[0]},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
 
     prediction = response.json()["prediction"]
 
