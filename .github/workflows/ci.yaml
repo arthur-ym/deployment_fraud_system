@@ -3,10 +3,16 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
-    tags: ["v*.*.*"]
+    branches:
+      - dev
+      - main
+    tags:
+      - "v*.*.*"
+
   pull_request:
-    branches: ["**"]
+    branches:
+      - dev
+      - main
 
 permissions:
   contents: read
