@@ -1,4 +1,3 @@
-
 name: CD
 
 on:
@@ -11,7 +10,7 @@ permissions:
 
 jobs:
   publish-image:
-    name: Publish dev and staging images
+    name: Publish Docker image
     runs-on: ubuntu-latest
 
     if: >-
@@ -40,8 +39,9 @@ jobs:
         with:
           images: ${{ vars.DOCKERHUB_USERNAME }}/deployment-fraud-system
           tags: |
-            type=raw,value=dev
+            type=raw,value=dev,enable=${{ github.event.workflow_run.head_branch == 'dev' }}
             type=raw,value=stg,enable=${{ github.event.workflow_run.head_branch == 'main' }}
+            type=raw,value=${{ github.event.workflow_run.head_branch }},enable=${{ startsWith(github.event.workflow_run.head_branch, 'v') && contains(github.event.workflow_run.head_branch, '.') }}
             type=raw,value=sha-${{ github.event.workflow_run.head_sha }}
 
       - name: Build and publish image
