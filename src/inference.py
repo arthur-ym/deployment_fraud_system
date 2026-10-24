@@ -6,7 +6,6 @@ project root) and exposes a /predict endpoint that accepts JSON
 {"X": [values]} and returns predictions.
 """
 
-from typing import List
 import os
 from contextlib import asynccontextmanager
 
@@ -14,7 +13,6 @@ import numpy as np
 import xgboost as xgb
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-
 
 # Determine model path relative to this file
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -36,9 +34,7 @@ async def lifespan(app: FastAPI):
         model.load_model(MODEL_PATH)
     except Exception as exc:
         model = None
-        raise RuntimeError(
-            f"Failed to load model from {MODEL_PATH}: {exc}"
-        ) from exc
+        raise RuntimeError(f"Failed to load model from {MODEL_PATH}: {exc}") from exc
 
     try:
         yield
@@ -53,7 +49,7 @@ app = FastAPI(
 
 
 class PredictRequest(BaseModel):
-    X: List
+    X: list
 
 
 @app.get("/")
@@ -87,5 +83,5 @@ def predict(req: PredictRequest) -> dict:
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", "8000"))
     uvicorn.run(app, host="0.0.0.0", port=port)
