@@ -1,12 +1,24 @@
-.PHONY: run-lint run-format run-test run-ci
 
-run-lint:
-	uv run ruff check src tests
+IMAGE := arthurym25/deployment-fraud-system
+TAG ?= dev
+PORT ?= 8000
 
-run-format:
-	uv run ruff format --check src tests
+.PHONY: lint test run-ci pull-image instantiate pull-and-instantiate build-image push-image
 
-run-test:
-	uv run pytest tests
+# CI: code quality and tests
+lint:
+	uv run ruff check .
 
-run-ci: run-lint run-format run-test
+test:
+	uv run pytest
+
+run-ci: lint test
+
+# Docker: local image management
+pull-image:
+	docker pull $(IMAGE):$(TAG)
+
+instantiate:
+	docker run --rm -p $(PORT):8000 $(IMAGE):$(TAG)
+	
+pull-and-instantiate: pull-image instantiate
