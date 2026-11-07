@@ -1,0 +1,608 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Fraud detection API on Amazon Linux 2023. Pulls a private Docker Hub image
+  with a Secrets Manager token, publishes container logs to CloudWatch,
+  alarms on CPU, instance status, and server errors, and stores each
+  prediction in a private S3 bucket.
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH. SSH stays closed until SSHLocation is a real address.
+
+  SSHLocation:
+    Type: String
+    Default: 127.0.0.1/32
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a CIDR block, for example 203.0.113.4/32.
+    Description: CIDR allowed to open port 22. Pass your address at deploy time if you need SSH.
+
+  ApiAllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    ConstraintDescription: Must be a CIDR block, for example 0.0.0.0/0.
+    Description: CIDR allowed to call the API on port 8000.
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedPattern: '^[a-z0-9]+\.[a-z0-9]+$'
+    Description: x86_64 instance type. The AMI is the Amazon Linux 2023 x86_64 SSM parameter.
+
+  DockerHubSecretId:
+    Type: String
+    Default: fraud-api/dockerhub
+    MinLength: 1
+    Description: >-
+      Secrets Manager secret name in this region. JSON keys are username and token.
+      Create it before deploying. The default key aws/secretsmanager needs no extra KMS permission.
+
+  DockerImage:
+    Type: String
+    Default: arthurym25/deployment-fraud-system:prod
+    AllowedPattern: '^[a-z0-9]+(?:[._-][a-z0-9]+)*/[a-z0-9]+(?:[._-][a-z0-9]+)*:[A-Za-z0-9_.-]+$'
+    Description: >-
+      Image to run. CI publishes dev, stg, sha-<commit>, and prod. It does not publish latest.
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
+    ConstraintDescription: Leave empty or provide an email address.
+    Description: Optional address subscribed to the alarm topic. The topic is created either way.
+
+  PredictionRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+    Description: Days to keep prediction objects before S3 expires them.
+
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - stg
+      - prod
+    Description: >-
+      Deployment environment. Separates this stack's CloudWatch log group,
+      metrics, and dashboard from the other environments.
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  FraudApiSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: SSH and fraud detection API
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHLocation
+          Description: SSH
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: !Ref ApiAllowedCidr
+          Description: Fraud detection API
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-fraud-api"
+
+  FraudApiEC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: FraudApiInstance
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadDockerHubSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DockerHubSecretId}-*"
+              - Sid: SignalStack
+                Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+              - Sid: WriteApiLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource:
+                  - !GetAtt FraudApiLogGroup.Arn
+                  - !Sub "${FraudApiLogGroup.Arn}:*"
+              - Sid: WritePredictions
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${FraudApiPredictionsBucket.Arn}/predictions/*"
+
+  FraudApiInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref FraudApiEC2Role
+
+  FraudApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/fraud-detection/${Environment}/api"
+      RetentionInDays: 30
+
+  FraudApiPredictionsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpirePredictions
+            Status: Enabled
+            Prefix: predictions/
+            ExpirationInDays: !Ref PredictionRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-predictions"
+
+  FraudApiPredictionsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FraudApiPredictionsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt FraudApiPredictionsBucket.Arn
+              - !Sub "${FraudApiPredictionsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  FraudApiAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-fraud-api-alarms"
+
+  FraudApiAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+      TopicArn: !Ref FraudApiAlarmTopic
+
+  FraudApiInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: FraudApiLogGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT15M
+    Properties:
+      ImageId: "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      IamInstanceProfile: !Ref FraudApiInstanceProfile
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: "0"
+          GroupSet:
+            - !GetAtt FraudApiSecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 30
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-fraud-api"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf install -y docker jq aws-cfn-bootstrap
+          systemctl enable --now docker
+
+          on_error() {
+            unset DOCKER_USER DOCKER_TOKEN || true
+            rm -f /tmp/docker-secret.json
+            docker logout >/dev/null 2>&1 || true
+            rm -f /root/.docker/config.json
+            /opt/aws/bin/cfn-signal -e 1 \
+              --stack ${AWS::StackName} \
+              --resource FraudApiInstance \
+              --region ${AWS::Region} || true
+          }
+          trap on_error ERR
+
+          # xtrace would write the token into /var/log/cloud-init-output.log
+          set +x
+          umask 077
+          aws secretsmanager get-secret-value \
+            --region ${AWS::Region} \
+            --secret-id "${DockerHubSecretId}" \
+            --query SecretString \
+            --output text > /tmp/docker-secret.json
+          DOCKER_USER=$(jq -r '.username' /tmp/docker-secret.json)
+          DOCKER_TOKEN=$(jq -r '.token' /tmp/docker-secret.json)
+          if [[ -z "${!DOCKER_USER}" || "${!DOCKER_USER}" == "null" || -z "${!DOCKER_TOKEN}" || "${!DOCKER_TOKEN}" == "null" ]]; then
+            echo "Secret ${DockerHubSecretId} must be JSON with username and token" >&2
+            unset DOCKER_USER DOCKER_TOKEN
+            false
+          fi
+          printf '%s' "${!DOCKER_TOKEN}" | docker login --username "${!DOCKER_USER}" --password-stdin
+          unset DOCKER_USER DOCKER_TOKEN
+          umask 022
+          set -x
+
+          docker pull "${DockerImage}"
+          rm -f /tmp/docker-secret.json
+          docker logout
+          rm -f /root/.docker/config.json
+
+          docker rm -f fraud-detection-api >/dev/null 2>&1 || true
+          docker run -d \
+            --name fraud-detection-api \
+            --restart unless-stopped \
+            --log-driver=awslogs \
+            --log-opt awslogs-region=${AWS::Region} \
+            --log-opt awslogs-group=/fraud-detection/${Environment}/api \
+            --log-opt awslogs-stream=fraud-api \
+            --log-opt awslogs-create-group=false \
+            -e PREDICTIONS_BUCKET=${FraudApiPredictionsBucket} \
+            -e AWS_DEFAULT_REGION=${AWS::Region} \
+            -e MODEL_VERSION="${DockerImage}" \
+            -p 8000:8000 \
+            "${DockerImage}"
+
+          for _ in 1 2 3 4 5 6; do
+            if [[ "$(docker inspect -f '{{.State.Running}}' fraud-detection-api 2>/dev/null || true)" == "true" ]]; then
+              break
+            fi
+            sleep 5
+          done
+          test "$(docker inspect -f '{{.State.Running}}' fraud-detection-api)" = "true"
+
+          trap - ERR
+          /opt/aws/bin/cfn-signal -e 0 \
+            --stack ${AWS::StackName} \
+            --resource FraudApiInstance \
+            --region ${AWS::Region}
+
+  FraudApiCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-cpu-high"
+      AlarmDescription: Fraud API instance CPU is above 80 percent.
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref FraudApiInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FraudApiAlarmTopic
+
+  FraudApiStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-status-check-failed"
+      AlarmDescription: Fraud API instance failed an EC2 status check.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref FraudApiInstance
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref FraudApiAlarmTopic
+
+  FraudApiRequestCountFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" }'
+      MetricTransformations:
+        - MetricName: RequestCount
+          MetricNamespace: !Sub "FraudApi/${Environment}"
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiClientErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.http_status >= 400 && $.http_status <= 499 }'
+      MetricTransformations:
+        - MetricName: ClientErrorCount
+          MetricNamespace: !Sub "FraudApi/${Environment}"
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiServerErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.http_status >= 500 && $.http_status <= 599 }'
+      MetricTransformations:
+        - MetricName: ServerErrorCount
+          MetricNamespace: !Sub "FraudApi/${Environment}"
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiInvalidFeaturesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.error_category = "invalid_features" }'
+      MetricTransformations:
+        - MetricName: InvalidFeaturesCount
+          MetricNamespace: !Sub "FraudApi/${Environment}"
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiModelErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.error_category = "model_error" }'
+      MetricTransformations:
+        - MetricName: ModelErrorCount
+          MetricNamespace: !Sub "FraudApi/${Environment}"
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiExceptionFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.error_category = "exception" }'
+      MetricTransformations:
+        - MetricName: ExceptionCount
+          MetricNamespace: !Sub "FraudApi/${Environment}"
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-server-errors"
+      AlarmDescription: Fraud API returned at least one HTTP 5xx response in five minutes.
+      Namespace: !Sub "FraudApi/${Environment}"
+      MetricName: ServerErrorCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FraudApiAlarmTopic
+
+  FraudApiDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-fraud-api"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Request volume",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 3600,
+                "metrics": [
+                  ["FraudApi/${Environment}", "RequestCount", {"label": "Requests"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Failed requests",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 3600,
+                "metrics": [
+                  ["FraudApi/${Environment}", "ClientErrorCount", {"label": "HTTP 4xx"}],
+                  ["FraudApi/${Environment}", "ServerErrorCount", {"label": "HTTP 5xx"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Failure rate",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "yAxis": {"left": {"min": 0, "max": 100, "label": "%"}},
+                "metrics": [
+                  ["FraudApi/${Environment}", "ClientErrorCount", {"id": "c", "stat": "Sum", "visible": false}],
+                  ["FraudApi/${Environment}", "ServerErrorCount", {"id": "s", "stat": "Sum", "visible": false}],
+                  ["FraudApi/${Environment}", "RequestCount", {"id": "r", "stat": "Sum", "visible": false}],
+                  [{"expression": "IF(r>0,100*(c+s)/r,0)", "label": "Failed requests %", "id": "rate"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Error categories",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 3600,
+                "metrics": [
+                  ["FraudApi/${Environment}", "InvalidFeaturesCount", {"label": "Invalid or missing features"}],
+                  ["FraudApi/${Environment}", "ModelErrorCount", {"label": "Model errors"}],
+                  ["FraudApi/${Environment}", "ExceptionCount", {"label": "Exceptions"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "CPU utilization",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 300,
+                "yAxis": {"left": {"min": 0, "max": 100}},
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "InstanceId", "${FraudApiInstance}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 12,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Network",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 300,
+                "metrics": [
+                  ["AWS/EC2", "NetworkIn", "InstanceId", "${FraudApiInstance}"],
+                  ["AWS/EC2", "NetworkOut", "InstanceId", "${FraudApiInstance}"]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 18,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Status checks",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Maximum",
+                "period": 60,
+                "metrics": [
+                  ["AWS/EC2", "StatusCheckFailed", "InstanceId", "${FraudApiInstance}"],
+                  ["AWS/EC2", "StatusCheckFailed_Instance", "InstanceId", "${FraudApiInstance}"],
+                  ["AWS/EC2", "StatusCheckFailed_System", "InstanceId", "${FraudApiInstance}"]
+                ]
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 18,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "API logs",
+                "region": "${AWS::Region}",
+                "query": "SOURCE '/fraud-detection/${Environment}/api' | filter event = \"request\" | fields @timestamp, request_id, http_status, duration_ms, error_category, error_message | sort @timestamp desc | limit 50",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref FraudApiInstance
+
+  PublicIp:
+    Description: Public IPv4 address
+    Value: !GetAtt FraudApiInstance.PublicIp
+
+  PredictUrl:
+    Description: POST JSON features to this URL
+    Value: !Sub "http://${FraudApiInstance.PublicIp}:8000/predict"
+
+  LogGroupName:
+    Description: CloudWatch log group. The container writes the fraud-api stream.
+    Value: !Ref FraudApiLogGroup
+
+  AlarmTopicArn:
+    Description: SNS topic that receives CPU, status-check, and server-error alarms
+    Value: !Ref FraudApiAlarmTopic
+
+  DashboardName:
+    Description: CloudWatch dashboard
+    Value: !Ref FraudApiDashboard
+
+  PredictionsBucketName:
+    Description: Private S3 bucket that stores one JSON object per prediction
+    Value: !Ref FraudApiPredictionsBucket
