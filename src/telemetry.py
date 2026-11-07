@@ -17,14 +17,8 @@ def model_version() -> str:
 
 
 def predictions_bucket() -> str:
+    """Get the predictions bucket from the environment variables."""
     return os.environ.get("PREDICTIONS_BUCKET", "").strip()
-
-
-def predicted_class(probability: float | None) -> int | None:
-    """Map a probability to a class. The cutoff is only for the stored record."""
-    if probability is None:
-        return None
-    return 1 if probability >= CLASS_THRESHOLD else 0
 
 
 def record_predict(
@@ -47,7 +41,6 @@ def record_predict(
         "status": "success" if succeeded else "error",
         "duration_ms": round(duration_ms, 3),
         "fraud_probability": fraud_probability,
-        "predicted_class": predicted_class(fraud_probability),
         "model_version": model_version(),
         "error_category": error_category,
         "error_message": error_message,
