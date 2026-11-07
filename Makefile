@@ -3,7 +3,7 @@ IMAGE := arthurym25/deployment-fraud-system
 TAG ?= dev
 PORT ?= 8000
 
-.PHONY: lint test run-ci pull-image instantiate pull-and-instantiate build-image push-image
+.PHONY: lint test run-ci lint-cloudformation pull-image instantiate pull-and-instantiate build-image push-image
 
 # CI: code quality and tests
 lint:
@@ -13,6 +13,9 @@ test:
 	uv run pytest
 
 run-ci: lint test
+
+lint-cloudformation:
+	uv run cfn-lint infra/fraud-api.yaml
 
 # Docker: local image management
 pull-image:
