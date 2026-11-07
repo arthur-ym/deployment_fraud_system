@@ -106,7 +106,6 @@ jobs:
           fi
           KEY="fraud-api/${ENV}/${SHA}/fraud-api.yaml"
           aws s3 cp infra/fraud-api.yaml "s3://${TEMPLATE_BUCKET}/${KEY}"
-          TEMPLATE_URL="https://s3.${AWS_REGION}.amazonaws.com/${TEMPLATE_BUCKET}/${KEY}"
           OVERRIDES=(
             "Environment=${ENV}"
             "DockerImage=${IMAGE}:sha-${SHA}"
@@ -132,7 +131,7 @@ jobs:
           fi
           aws cloudformation deploy \
             --stack-name "fraud-api-${ENV}" \
-            --template-url "${TEMPLATE_URL}" \
+            --template-file infra/fraud-api.yaml \
             --capabilities CAPABILITY_IAM \
             --no-fail-on-empty-changeset \
             --parameter-overrides "${OVERRIDES[@]}"
@@ -208,7 +207,6 @@ jobs:
           fi
           KEY="fraud-api/${ENV}/${SHA}/fraud-api.yaml"
           aws s3 cp infra/fraud-api.yaml "s3://${TEMPLATE_BUCKET}/${KEY}"
-          TEMPLATE_URL="https://s3.${AWS_REGION}.amazonaws.com/${TEMPLATE_BUCKET}/${KEY}"
           OVERRIDES=(
             "Environment=${ENV}"
             "DockerImage=${IMAGE}:sha-${SHA}"
@@ -234,7 +232,7 @@ jobs:
           fi
           aws cloudformation deploy \
             --stack-name "fraud-api-${ENV}" \
-            --template-url "${TEMPLATE_URL}" \
+            --template-file infra/fraud-api.yaml \
             --capabilities CAPABILITY_IAM \
             --no-fail-on-empty-changeset \
             --parameter-overrides "${OVERRIDES[@]}"
