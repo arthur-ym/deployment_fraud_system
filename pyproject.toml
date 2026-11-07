@@ -3,6 +3,7 @@ name = "deployment-fraud-system"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "boto3",
     "fastapi",
     "uvicorn[standard]>=0.22.0",
     "joblib",
@@ -20,6 +21,7 @@ dev = [
     "pip>=26.2.2",
     "pre-commit>=4.7.0",
     "httpx2>=2.16.0",
+    "cfn-lint>=1.60.0",
 ]
 
 [tool.pytest.ini_options]
