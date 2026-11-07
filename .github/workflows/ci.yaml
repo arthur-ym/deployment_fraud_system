@@ -1,5 +1,5 @@
 
-name: CI
+name: Build and test
 
 on:
   push:
@@ -76,3 +76,10 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t deployment-fraud-system:ci .
+
+  deploy-dev:
+    name: Deploy dev
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    uses: ./.github/workflows/deploy-dev.yaml
+    secrets: inherit
