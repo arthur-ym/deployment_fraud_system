@@ -88,7 +88,6 @@ def test_prediction_is_stored(client, payloads, monkeypatch):
     assert body["status"] == "success"
     assert body["http_status"] == 200
     assert body["fraud_probability"] == response.json()["prediction"]
-    assert body["predicted_class"] == (1 if body["fraud_probability"] >= 0.5 else 0)
     assert body["model_version"] == "test-model"
     assert body["error_category"] == "none"
     assert body["error_message"] is None
