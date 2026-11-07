@@ -2,7 +2,7 @@
 
 This file is a CloudFormation template. It describes the AWS resources for one fraud-detection API server. CloudFormation reads the file and creates those resources together as one **stack**. Deleting the stack deletes the resources the stack created.
 
-The template does not contain the model or the Python API. It starts an EC2 virtual machine, installs Docker, pulls `arthurym25/deployment-fraud-system:prod` from a private Docker Hub repository, and runs that image on port 8000. The running container writes one JSON log line per `/predict` call and stores one JSON object per prediction in S3. The template turns those log lines into metrics and graphs.
+The template does not contain the model or the Python API. It starts an EC2 virtual machine, installs Docker, pulls the image named by `DockerImage` (by default `arthurym25/deployment-fraud-system:prod`) from a private Docker Hub repository, and runs that image on port 8000. An Elastic IP stays on the machine, so the address does not change when the instance is replaced. The running container writes one JSON log line per `/predict` call and stores one JSON object per prediction in S3. The template turns those log lines into metrics and graphs.
 
 Acronyms used below are listed in [Glossary](#glossary).
 
@@ -19,6 +19,7 @@ CloudFormation creates the stack
         +-- predictions bucket private store for each prediction
         +-- SNS topic          where alarms are sent
         +-- EC2 instance       the machine that runs the container
+        +-- Elastic IP         the address clients keep using
         +-- three alarms       CPU, status checks, and server errors
         +-- dashboard          request graphs, host graphs, and recent logs
         |
@@ -56,8 +57,8 @@ The logical ID is the name other parts of the template use. The type is the AWS 
 CloudFormation adds functions that YAML itself does not have. They look like `!Ref` or `!Sub`.
 
 - `!Ref KeyName` inserts the value of the `KeyName` parameter.
-- `!Ref FraudApiInstance` inserts the instance ID of the resource with that logical ID. For most resources, `!Ref` returns the main ID.
-- `!GetAtt FraudApiInstance.PublicIp` reads one attribute of a resource. `!Ref` cannot return the public IP, so the template uses `!GetAtt`.
+- `!Ref FraudApiInstance` inserts the instance ID. `!Ref FraudApiEip` inserts the Elastic IP address. For most resources, `!Ref` returns the main ID.
+- `!GetAtt FraudApiEip.AllocationId` reads one attribute of a resource. The template uses `!GetAtt` when the value it needs is not the main ID, including log group and bucket ARNs.
 - `!Sub "${AWS::StackName}-fraud-api"` builds a string and replaces `${...}` with a value. `AWS::StackName`, `AWS::Region`, and `AWS::AccountId` are provided by CloudFormation when the stack is created.
 - `!Equals` and `!Not` are comparisons. They are used in the condition below.
 - `Fn::Base64` encodes the startup script. EC2 requires user data to be Base64.
@@ -75,7 +76,7 @@ Parameters are the knobs. Anything with a `Default` can be left alone.
 | `ApiAllowedCidr` | `0.0.0.0/0` | The IP range allowed to call the API on port 8000. | This is the product: clients POST to `/predict`. The security group has to let that traffic in. `0.0.0.0/0` means any client on the internet. Narrow it if only one office or one other service should be able to call the model. |
 | `InstanceType` | `t3.small` | CPU and memory size of the virtual machine. | The fraud model and the API process need a fixed amount of CPU and RAM. `t3.small` is the small default. Change this to a larger x86_64 type if predictions are slow, without editing the rest of the template. The Amazon Linux image is x86_64, so an Arm type such as `t4g.small` would not boot. |
 | `DockerHubSecretId` | `fraud-api/dockerhub` | Name of a Secrets Manager secret you create before the deploy. The secret value is JSON with keys `username` and `token`. | The image is private on Docker Hub. The instance has to log in before `docker pull`. The token stays in Secrets Manager instead of being written into this file or the startup script. |
-| `DockerImage` | `arthurym25/deployment-fraud-system:prod` | The Docker image and tag the startup script pulls and runs. The same string is passed to the container as `MODEL_VERSION`. | CI publishes several tags (`dev`, `stg`, `sha-<commit>`, `prod`) and does not publish `latest`. This parameter picks which build the server runs, so you can deploy `prod` or one commit without changing the script. Each stored prediction records this value. |
+| `DockerImage` | `arthurym25/deployment-fraud-system:prod` | The Docker image and tag the start script pulls and runs. The same string is passed to the container as `MODEL_VERSION`. | CI publishes `dev`, `stg`, `sha-<commit>`, and `prod`. It does not publish `latest`. Dev and staging deploys pass `:dev` and `:stg`. Those tags move, and the pipeline restarts the container on the existing instance. Production passes `sha-<commit>`, so each production release changes this value and replaces the instance. Each stored prediction records this value. |
 | `AlarmEmail` | empty | Email address subscribed to the alarm topic. Empty means no subscription. SNS still asks you to confirm the address before it delivers mail. | The stack watches CPU, EC2 status checks, and HTTP 5xx responses. This is who gets told. Leave it empty when nobody needs those emails. |
 | `PredictionRetentionDays` | `365` | How long S3 keeps objects under `predictions/` before deleting them. Allowed range is 1 to 3650 days. | Prediction files accumulate one object per call. This cap is the cost control. Old files expire on their own. |
 | `Environment` | none, you must pass it | `dev`, `stg`, or `prod`. The log group is `/fraud-detection/<environment>/api` and custom metrics use the namespace `FraudApi/<environment>`. | Three stacks in one region need different CloudWatch names. The same log group and metric namespace would mix dev, staging, and production on one dashboard. |
@@ -166,7 +167,7 @@ The objects are a few kilobytes. Moving objects that small to Infrequent Access 
 
 - Amazon Linux 2023, looked up from SSM.
 - Your key pair and instance type.
-- A public IPv4 address on the default network interface.
+- A public IPv4 address on the default network interface, plus an Elastic IP (`FraudApiEip`) associated with the instance. Clients and SSH use the Elastic IP. That address is what `PublicIp` prints, and it stays when a later update replaces the instance.
 - The security group attached to that interface.
 - A 30 GB encrypted gp3 disk as `/dev/xvda`.
 - IMDSv2 required (`HttpTokens: required`). The instance metadata service is how software on the machine gets temporary credentials for the IAM role. Version 2 is the current requirement.
@@ -178,20 +179,26 @@ The objects are a few kilobytes. Moving objects that small to Infrequent Access 
 
 ### Startup script
 
-`UserData` is a bash script that runs once as root on first boot. CloudFormation substitutes `${AWS::StackName}`, `${DockerHubSecretId}`, `${DockerImage}`, `${FraudApiPredictionsBucket}`, and the other `${...}` values before the instance sees the script. The `{{.State.Running}}` braces are left for the `docker inspect` format string; `!Sub` only replaces `${...}`.
+`UserData` is a bash script that runs once as root on first boot. It installs Docker, writes `/usr/local/bin/start-fraud-api.sh`, runs that script, and then sends `cfn-signal`. CloudFormation substitutes `${AWS::StackName}`, `${DockerHubSecretId}`, `${DockerImage}`, `${FraudApiPredictionsBucket}`, and the other `${...}` values before the instance sees the script. The `{{.State.Running}}` braces are left for the `docker inspect` format string; `!Sub` only replaces `${...}`.
 
-Changing this script replaces the instance. The new machine has a new public IP, so `PublicIp` and `PredictUrl` change. Publish the image first, including the tag this stack pulls (`prod` unless you override `DockerImage`). A stack update that boots the old image leaves the bucket empty and the new graphs at zero.
+Changing this script replaces the instance. The Elastic IP moves to the new machine, so `PublicIp` and `PredictUrl` stay the same. Dev and staging pass a `DockerImage` tag that does not change between commits (`:dev` or `:stg`), so those deploys leave the instance in place. After the stack update, the pipeline runs `start-fraud-api.sh` through Systems Manager. The script pulls the new image before it removes the current container, so a failed pull leaves the API up. Requests fail only for the few seconds it takes to start the new container.
 
-The script does this:
+Production passes `sha-<commit>`. That changes the script on every release, so production still replaces the instance. The Elastic IP stays, and the API is down while the new machine boots. Publish the image first, including the tag this stack pulls.
+
+The boot script does this:
 
 1. Install Docker, `jq`, and `aws-cfn-bootstrap` (the package that provides `cfn-signal`).
 2. Start Docker.
-3. Install an error trap that wipes the Docker token and signals failure.
-4. Turn command tracing off, then read the Docker Hub username and token from Secrets Manager. Tracing stays off so the token is not written to `/var/log/cloud-init-output.log`.
-5. `docker login`, pull the image, then log out and delete the secret file and Docker config.
-6. Run the container in the background, named `fraud-detection-api`, with `--restart unless-stopped`, publishing port 8000, and sending logs to the CloudWatch group. It passes three environment variables: `PREDICTIONS_BUCKET` (this stack's bucket), `AWS_DEFAULT_REGION`, and `MODEL_VERSION` (the `DockerImage` value).
-7. Wait up to about 30 seconds for the container to be running.
-8. Signal success.
+3. Write `start-fraud-api.sh` and make it executable.
+4. Run that script. If it exits with an error, signal failure.
+5. Signal success.
+
+`start-fraud-api.sh` does this, both on first boot and when Systems Manager runs it later:
+
+1. Read the Docker Hub username and token from Secrets Manager. Command tracing stays off so the token is not written to the log.
+2. `docker login` and pull the image, then log out and delete the secret file and Docker config.
+3. Remove the current container and run a new one named `fraud-detection-api`, with `--restart unless-stopped`, publishing port 8000, and sending logs to the CloudWatch group. It passes three environment variables: `PREDICTIONS_BUCKET` (this stack's bucket), `AWS_DEFAULT_REGION`, and `MODEL_VERSION` (the `DockerImage` value).
+4. Wait up to about 30 seconds for the container to be running. This script does not send `cfn-signal`.
 
 `${!DOCKER_USER}` is bash indirect expansion, not CloudFormation. `!Sub` turns it into `${DOCKER_USER}` in the script that actually runs. The leading `!` tells `!Sub` to leave that dollar expression alone.
 
@@ -240,7 +247,7 @@ Outputs are the values CloudFormation prints on the stack's Outputs tab after th
 | Output | What you get | Why you use it |
 |---|---|---|
 | `InstanceId` | The EC2 id, such as `i-0abc123`. | The console, the alarms, and the AWS CLI all refer to the machine by this id. You need it to stop the instance, open a Session Manager shell, or check why the stack is still waiting on the boot signal. |
-| `PublicIp` | The public IPv4 address of that machine. | This is the address of the server on the internet. SSH uses it (`ec2-user@<public-ip>`). It can change if the instance is stopped and started again, and it changes when a template update replaces the instance. |
+| `PublicIp` | The Elastic IP attached to the instance. | This is the address of the server on the internet. SSH uses it (`ec2-user@<public-ip>`). CloudFormation moves this address to the new machine when a template update replaces the instance, so clients keep the same URL. |
 | `PredictUrl` | `http://<public-ip>:8000/predict` | This is the fraud API. A client POSTs a JSON body of features here and gets a prediction back. It is the address you give to a notebook, a test script, or another service. |
 | `LogGroupName` | `/fraud-detection/<environment>/api`, such as `/fraud-detection/prod/api` | Container stdout and stderr go here, in a stream named `fraud-api`. Open this log group in CloudWatch when a request fails or the process crashes. The group is kept for 30 days. |
 | `AlarmTopicArn` | The ARN of the SNS topic, such as `arn:aws:sns:eu-central-1:511743255923:my-stack-fraud-api-alarms`. | CPU, status-check, and server-error alarms publish to this topic. Use the ARN to add another subscriber later, such as a second email or a chat webhook, without editing the alarms. |
@@ -279,8 +286,8 @@ Short meanings for the acronyms in this guide and in `fraud-api.yaml`. Each one 
 | ID | Identifier | The short name AWS assigns, such as the instance id `i-0abc123`. |
 | IMDS | Instance Metadata Service | A link from software on the machine to EC2, at `169.254.169.254`. The instance uses it to fetch temporary credentials for its IAM role. |
 | IMDSv2 | Instance Metadata Service version 2 | The current IMDS. `HttpTokens: required` means the instance refuses the older version. The hop limit is 2 so the container can use those credentials. |
-| IP | Internet Protocol address | The numeric address of a machine. `PublicIp` is the one clients and SSH use. |
-| IPv4 | Internet Protocol version 4 | The familiar address form, such as `203.0.113.4`. This template assigns a public IPv4 address. |
+| IP | Internet Protocol address | The numeric address of a machine. `PublicIp` is the Elastic IP clients and SSH use. |
+| IPv4 | Internet Protocol version 4 | The familiar address form, such as `203.0.113.4`. This template allocates one public IPv4 Elastic IP. |
 | JSON | JavaScript Object Notation | The text format of the Docker Hub secret, the dashboard body, each request log line, and each stored prediction. |
 | KMS | Key Management Service | AWS encryption keys. The Docker Hub secret uses the default Secrets Manager key, and the bucket uses SSE-S3, so the role needs no extra KMS permission. |
 | RAM | Random-access memory | Memory on the instance. `InstanceType` chooses how much CPU and RAM the model gets. |
@@ -288,7 +295,7 @@ Short meanings for the acronyms in this guide and in `fraud-api.yaml`. Each one 
 | SNS | Simple Notification Service | The alarm mailbox. CPU, status, and server-error alarms publish a message to an SNS topic, and email is one possible subscriber. |
 | SSE-S3 | S3-managed server-side encryption | S3 encrypts each prediction object with AES-256. You do not create or pay for a separate key. |
 | SSH | Secure Shell | A remote terminal on port 22. `KeyName` is the key, `SSHLocation` is who may connect. |
-| SSM | AWS Systems Manager | The service that stores the current Amazon Linux AMI id, and Session Manager, which can open a shell while SSH is closed. |
+| SSM | AWS Systems Manager | The service that stores the current Amazon Linux AMI id. Session Manager can open a shell while SSH is closed. Dev and staging deploys use Run Command to run `start-fraud-api.sh` on the existing instance. |
 | TCP | Transmission Control Protocol | The network protocol of the two firewall rules: port 22 for SSH and port 8000 for the API. |
 | URL | Uniform Resource Locator | A web address. `PredictUrl` is the one clients call. |
 | YAML | YAML Ain't Markup Language | The file format of `fraud-api.yaml`. Indentation marks what belongs inside what. |

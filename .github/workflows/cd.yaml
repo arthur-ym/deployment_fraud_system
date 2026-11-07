@@ -2,7 +2,7 @@ name: CD
 
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["Build and test"]
     types: [completed]
 
 permissions:
@@ -16,7 +16,8 @@ jobs:
     if: >-
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_repository.full_name == github.repository
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == 'main'
 
     steps:
       - name: Check out tested commit
@@ -39,7 +40,6 @@ jobs:
         with:
           images: ${{ vars.DOCKERHUB_USERNAME }}/deployment-fraud-system
           tags: |
-            type=raw,value=dev,enable=${{ github.event.workflow_run.head_branch == 'dev' }}
             type=raw,value=stg,enable=${{ github.event.workflow_run.head_branch == 'main' }}
             type=raw,value=${{ github.event.workflow_run.head_branch }},enable=${{ startsWith(github.event.workflow_run.head_branch, 'v') && contains(github.event.workflow_run.head_branch, '.') }}
             type=raw,value=sha-${{ github.event.workflow_run.head_sha }}
@@ -53,23 +53,20 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   deploy:
-    name: Deploy ${{ github.event.workflow_run.head_branch == 'main' && 'stg' || 'dev' }}
+    name: Deploy stg
     runs-on: ubuntu-latest
     needs: [publish-image]
     timeout-minutes: 30
 
     concurrency:
-      group: fraud-api-${{ github.event.workflow_run.head_branch == 'main' && 'stg' || 'dev' }}
+      group: fraud-api-stg
       cancel-in-progress: false
 
-    environment: ${{ github.event.workflow_run.head_branch == 'main' && 'staging' || 'dev' }}
+    environment: staging
 
     if: >-
       needs.publish-image.result == 'success' &&
-      (
-        github.event.workflow_run.head_branch == 'dev' ||
-        github.event.workflow_run.head_branch == 'main'
-      )
+      github.event.workflow_run.head_branch == 'main'
 
     steps:
       - name: Check out tested commit
@@ -86,7 +83,7 @@ jobs:
 
       - name: Upload template and deploy stack
         env:
-          ENV: ${{ github.event.workflow_run.head_branch == 'main' && 'stg' || 'dev' }}
+          ENV: stg
           TEMPLATE_BUCKET: ${{ vars.TEMPLATE_BUCKET }}
           AWS_REGION: ${{ vars.AWS_REGION }}
           SHA: ${{ github.event.workflow_run.head_sha }}
@@ -108,7 +105,7 @@ jobs:
           aws s3 cp infra/fraud-api.yaml "s3://${TEMPLATE_BUCKET}/${KEY}"
           OVERRIDES=(
             "Environment=${ENV}"
-            "DockerImage=${IMAGE}:sha-${SHA}"
+            "DockerImage=${IMAGE}:stg"
             "KeyName=${KEY_NAME}"
           )
           if [[ -n "${ALARM_EMAIL}" ]]; then
@@ -135,6 +132,62 @@ jobs:
             --capabilities CAPABILITY_IAM \
             --no-fail-on-empty-changeset \
             --parameter-overrides "${OVERRIDES[@]}"
+
+      - name: Restart container on the existing instance
+        env:
+          ENV: stg
+        run: |
+          set -euo pipefail
+          INSTANCE_ID=$(aws cloudformation describe-stacks \
+            --stack-name "fraud-api-${ENV}" \
+            --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" \
+            --output text)
+          STATUS=""
+          for _ in $(seq 1 30); do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text)
+            if [[ "$STATUS" == "Online" ]]; then
+              break
+            fi
+            sleep 10
+          done
+          if [[ "$STATUS" != "Online" ]]; then
+            echo "Instance ${INSTANCE_ID} is not online in Systems Manager" >&2
+            exit 1
+          fi
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Restart fraud-api container" \
+            --timeout-seconds 600 \
+            --parameters 'commands=["/usr/local/bin/start-fraud-api.sh"]' \
+            --query "Command.CommandId" \
+            --output text)
+          for _ in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query Status \
+              --output text 2>/dev/null || true)
+            case "$STATUS" in
+              Success)
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation \
+                  --command-id "$CMD_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query "{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}" \
+                  --output text
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          echo "Timed out waiting for the container restart on ${INSTANCE_ID}" >&2
+          exit 1
 
   promote-production:
     name: Promote image to production
