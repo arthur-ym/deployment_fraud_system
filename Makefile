@@ -8,6 +8,7 @@ PORT ?= 8000
 # CI: code quality and tests
 lint:
 	uv run ruff check src tests
+	uv run ruff format --check --diff src tests
 
 test:
 	uv run pytest
