@@ -3,6 +3,7 @@ name = "deployment-fraud-system"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
+    "boto3",
     "fastapi",
     "uvicorn[standard]>=0.22.0",
     "joblib",

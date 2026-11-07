@@ -1,8 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Fraud detection API on Amazon Linux 2023. Pulls a private Docker Hub image
-  with a Secrets Manager token, publishes container logs to CloudWatch, and
-  alarms on CPU and instance status.
+  with a Secrets Manager token, publishes container logs to CloudWatch,
+  alarms on CPU, instance status, and server errors, and stores each
+  prediction in a private S3 bucket.
 
 Parameters:
   KeyName:
@@ -50,6 +51,13 @@ Parameters:
     AllowedPattern: '^$|^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'
     ConstraintDescription: Leave empty or provide an email address.
     Description: Optional address subscribed to the alarm topic. The topic is created either way.
+
+  PredictionRetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+    Description: Days to keep prediction objects before S3 expires them.
 
 Conditions:
   HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
@@ -108,6 +116,10 @@ Resources:
                 Resource:
                   - !GetAtt FraudApiLogGroup.Arn
                   - !Sub "${FraudApiLogGroup.Arn}:*"
+              - Sid: WritePredictions
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${FraudApiPredictionsBucket.Arn}/predictions/*"
 
   FraudApiInstanceProfile:
     Type: AWS::IAM::InstanceProfile
@@ -120,6 +132,51 @@ Resources:
     Properties:
       LogGroupName: /fraud-detection/api
       RetentionInDays: 30
+
+  FraudApiPredictionsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpirePredictions
+            Status: Enabled
+            Prefix: predictions/
+            ExpirationInDays: !Ref PredictionRetentionDays
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-predictions"
+
+  FraudApiPredictionsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FraudApiPredictionsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt FraudApiPredictionsBucket.Arn
+              - !Sub "${FraudApiPredictionsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
 
   FraudApiAlarmTopic:
     Type: AWS::SNS::Topic
@@ -149,7 +206,7 @@ Resources:
       MetadataOptions:
         HttpEndpoint: enabled
         HttpTokens: required
-        HttpPutResponseHopLimit: 1
+        HttpPutResponseHopLimit: 2
       NetworkInterfaces:
         - AssociatePublicIpAddress: true
           DeleteOnTermination: true
@@ -219,6 +276,9 @@ Resources:
             --log-opt awslogs-group=/fraud-detection/api \
             --log-opt awslogs-stream=fraud-api \
             --log-opt awslogs-create-group=false \
+            -e PREDICTIONS_BUCKET=${FraudApiPredictionsBucket} \
+            -e AWS_DEFAULT_REGION=${AWS::Region} \
+            -e MODEL_VERSION="${DockerImage}" \
             -p 8000:8000 \
             "${DockerImage}"
 
@@ -274,6 +334,88 @@ Resources:
       AlarmActions:
         - !Ref FraudApiAlarmTopic
 
+  FraudApiRequestCountFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" }'
+      MetricTransformations:
+        - MetricName: RequestCount
+          MetricNamespace: FraudApi
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiClientErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.http_status >= 400 && $.http_status <= 499 }'
+      MetricTransformations:
+        - MetricName: ClientErrorCount
+          MetricNamespace: FraudApi
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiServerErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.http_status >= 500 && $.http_status <= 599 }'
+      MetricTransformations:
+        - MetricName: ServerErrorCount
+          MetricNamespace: FraudApi
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiInvalidFeaturesFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.error_category = "invalid_features" }'
+      MetricTransformations:
+        - MetricName: InvalidFeaturesCount
+          MetricNamespace: FraudApi
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiModelErrorFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.error_category = "model_error" }'
+      MetricTransformations:
+        - MetricName: ModelErrorCount
+          MetricNamespace: FraudApi
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiExceptionFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref FraudApiLogGroup
+      FilterPattern: '{ $.event = "request" && $.error_category = "exception" }'
+      MetricTransformations:
+        - MetricName: ExceptionCount
+          MetricNamespace: FraudApi
+          MetricValue: "1"
+          Unit: Count
+
+  FraudApiServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-server-errors"
+      AlarmDescription: Fraud API returned at least one HTTP 5xx response in five minutes.
+      Namespace: FraudApi
+      MetricName: ServerErrorCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref FraudApiAlarmTopic
+
   FraudApiDashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -285,6 +427,80 @@ Resources:
               "type": "metric",
               "x": 0,
               "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Request volume",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 3600,
+                "metrics": [
+                  ["FraudApi", "RequestCount", {"label": "Requests"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Failed requests",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 3600,
+                "metrics": [
+                  ["FraudApi", "ClientErrorCount", {"label": "HTTP 4xx"}],
+                  ["FraudApi", "ServerErrorCount", {"label": "HTTP 5xx"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Failure rate",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "period": 3600,
+                "yAxis": {"left": {"min": 0, "max": 100, "label": "%"}},
+                "metrics": [
+                  ["FraudApi", "ClientErrorCount", {"id": "c", "stat": "Sum", "visible": false}],
+                  ["FraudApi", "ServerErrorCount", {"id": "s", "stat": "Sum", "visible": false}],
+                  ["FraudApi", "RequestCount", {"id": "r", "stat": "Sum", "visible": false}],
+                  [{"expression": "IF(r>0,100*(c+s)/r,0)", "label": "Failed requests %", "id": "rate"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "title": "Error categories",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 3600,
+                "metrics": [
+                  ["FraudApi", "InvalidFeaturesCount", {"label": "Invalid or missing features"}],
+                  ["FraudApi", "ModelErrorCount", {"label": "Model errors"}],
+                  ["FraudApi", "ExceptionCount", {"label": "Exceptions"}]
+                ]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 12,
               "width": 12,
               "height": 6,
               "properties": {
@@ -302,7 +518,7 @@ Resources:
             {
               "type": "metric",
               "x": 12,
-              "y": 0,
+              "y": 12,
               "width": 12,
               "height": 6,
               "properties": {
@@ -320,7 +536,7 @@ Resources:
             {
               "type": "metric",
               "x": 0,
-              "y": 6,
+              "y": 18,
               "width": 12,
               "height": 6,
               "properties": {
@@ -339,13 +555,13 @@ Resources:
             {
               "type": "log",
               "x": 12,
-              "y": 6,
+              "y": 18,
               "width": 12,
               "height": 6,
               "properties": {
                 "title": "API logs",
                 "region": "${AWS::Region}",
-                "query": "SOURCE '/fraud-detection/api' | fields @timestamp, @message | sort @timestamp desc | limit 50",
+                "query": "SOURCE '/fraud-detection/api' | filter event = \"request\" | fields @timestamp, request_id, http_status, duration_ms, error_category, error_message | sort @timestamp desc | limit 50",
                 "view": "table"
               }
             }
@@ -370,9 +586,13 @@ Outputs:
     Value: !Ref FraudApiLogGroup
 
   AlarmTopicArn:
-    Description: SNS topic that receives CPU and status-check alarms
+    Description: SNS topic that receives CPU, status-check, and server-error alarms
     Value: !Ref FraudApiAlarmTopic
 
   DashboardName:
     Description: CloudWatch dashboard
     Value: !Ref FraudApiDashboard
+
+  PredictionsBucketName:
+    Description: Private S3 bucket that stores one JSON object per prediction
+    Value: !Ref FraudApiPredictionsBucket
