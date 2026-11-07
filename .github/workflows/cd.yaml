@@ -106,9 +106,14 @@ jobs:
           fi
           KEY="fraud-api/${ENV}/${SHA}/fraud-api.yaml"
           aws s3 cp infra/fraud-api.yaml "s3://${TEMPLATE_BUCKET}/${KEY}"
+          if [[ "$ENV" == "stg" ]]; then
+            TAG=stg
+          else
+            TAG=dev
+          fi
           OVERRIDES=(
             "Environment=${ENV}"
-            "DockerImage=${IMAGE}:sha-${SHA}"
+            "DockerImage=${IMAGE}:${TAG}"
             "KeyName=${KEY_NAME}"
           )
           if [[ -n "${ALARM_EMAIL}" ]]; then
@@ -135,6 +140,62 @@ jobs:
             --capabilities CAPABILITY_IAM \
             --no-fail-on-empty-changeset \
             --parameter-overrides "${OVERRIDES[@]}"
+
+      - name: Restart container on the existing instance
+        env:
+          ENV: ${{ github.event.workflow_run.head_branch == 'main' && 'stg' || 'dev' }}
+        run: |
+          set -euo pipefail
+          INSTANCE_ID=$(aws cloudformation describe-stacks \
+            --stack-name "fraud-api-${ENV}" \
+            --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" \
+            --output text)
+          STATUS=""
+          for _ in $(seq 1 30); do
+            STATUS=$(aws ssm describe-instance-information \
+              --filters "Key=InstanceIds,Values=${INSTANCE_ID}" \
+              --query "InstanceInformationList[0].PingStatus" \
+              --output text)
+            if [[ "$STATUS" == "Online" ]]; then
+              break
+            fi
+            sleep 10
+          done
+          if [[ "$STATUS" != "Online" ]]; then
+            echo "Instance ${INSTANCE_ID} is not online in Systems Manager" >&2
+            exit 1
+          fi
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Restart fraud-api container" \
+            --timeout-seconds 600 \
+            --parameters 'commands=["/usr/local/bin/start-fraud-api.sh"]' \
+            --query "Command.CommandId" \
+            --output text)
+          for _ in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$CMD_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query Status \
+              --output text 2>/dev/null || true)
+            case "$STATUS" in
+              Success)
+                exit 0
+                ;;
+              Failed|Cancelled|TimedOut)
+                aws ssm get-command-invocation \
+                  --command-id "$CMD_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query "{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}" \
+                  --output text
+                exit 1
+                ;;
+            esac
+            sleep 10
+          done
+          echo "Timed out waiting for the container restart on ${INSTANCE_ID}" >&2
+          exit 1
 
   promote-production:
     name: Promote image to production
