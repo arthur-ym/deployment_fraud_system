@@ -34,10 +34,10 @@ A template is YAML with a few fixed sections. This file uses these:
 |---|---|---|
 | `AWSTemplateFormatVersion` | 1 | Always `2010-09-09`. It marks the file as a CloudFormation template. |
 | `Description` | 2–6 | A sentence CloudFormation shows next to the stack. |
-| `Parameters` | 8–60 | Values you fill in at deploy time. The template stays the same; the values change. |
-| `Conditions` | 62–63 | A yes/no test used to skip a resource. |
-| `Resources` | 65–569 | The AWS objects to create. This is the body of the template. |
-| `Outputs` | 571–598 | Values CloudFormation prints after the stack succeeds, so you do not have to hunt for them in the console. |
+| `Parameters` | 8–70 | Values you fill in at deploy time. The template stays the same; the values change. |
+| `Conditions` | 72–73 | A yes/no test used to skip a resource. |
+| `Resources` | 75–579 | The AWS objects to create. This is the body of the template. |
+| `Outputs` | 581–608 | Values CloudFormation prints after the stack succeeds, so you do not have to hunt for them in the console. |
 
 Each resource has a **logical ID**, a **type**, and **properties**. In this block, `FraudApiLogGroup` is the logical ID and `AWS::Logs::LogGroup` is the type:
 
@@ -45,7 +45,7 @@ Each resource has a **logical ID**, a **type**, and **properties**. In this bloc
 FraudApiLogGroup:
   Type: AWS::Logs::LogGroup
   Properties:
-    LogGroupName: /fraud-detection/api
+    LogGroupName: !Sub "/fraud-detection/${Environment}/api"
     RetentionInDays: 30
 ```
 
@@ -78,8 +78,9 @@ Parameters are the knobs. Anything with a `Default` can be left alone.
 | `DockerImage` | `arthurym25/deployment-fraud-system:prod` | The Docker image and tag the startup script pulls and runs. The same string is passed to the container as `MODEL_VERSION`. | CI publishes several tags (`dev`, `stg`, `sha-<commit>`, `prod`) and does not publish `latest`. This parameter picks which build the server runs, so you can deploy `prod` or one commit without changing the script. Each stored prediction records this value. |
 | `AlarmEmail` | empty | Email address subscribed to the alarm topic. Empty means no subscription. SNS still asks you to confirm the address before it delivers mail. | The stack watches CPU, EC2 status checks, and HTTP 5xx responses. This is who gets told. Leave it empty when nobody needs those emails. |
 | `PredictionRetentionDays` | `365` | How long S3 keeps objects under `predictions/` before deleting them. Allowed range is 1 to 3650 days. | Prediction files accumulate one object per call. This cap is the cost control. Old files expire on their own. |
+| `Environment` | none, you must pass it | `dev`, `stg`, or `prod`. The log group is `/fraud-detection/<environment>/api` and custom metrics use the namespace `FraudApi/<environment>`. | Three stacks in one region need different CloudWatch names. The same log group and metric namespace would mix dev, staging, and production on one dashboard. |
 
-`AllowedPattern` is a regex. CloudFormation rejects the deploy if a value does not match, before it creates anything.
+`AllowedPattern` is a regex. CloudFormation rejects the deploy if a value does not match, before it creates anything. `Environment` uses `AllowedValues` instead: `dev`, `stg`, or `prod`.
 
 ## Conditions
 
@@ -115,9 +116,9 @@ Creating a role needs an extra confirmation on deploy: `--capabilities CAPABILIT
 
 ### Log group, metric filters, and alarms
 
-`FraudApiLogGroup` is CloudWatch log group `/fraud-detection/api`, kept for 30 days. The container writes a stream named `fraud-api` inside it. The name is fixed, so a second stack in the same region cannot create the same log group.
+`FraudApiLogGroup` is CloudWatch log group `/fraud-detection/${Environment}/api`, kept for 30 days. For the `prod` stack that path is `/fraud-detection/prod/api`. The container writes a stream named `fraud-api` inside it. Each environment has its own group, so three stacks in the same region do not share logs.
 
-Each `/predict` call prints one JSON object to that stream. A **metric filter** is a rule on the log group: when a line matches, CloudWatch adds 1 to a metric in the `FraudApi` namespace. The filters do not set a default value, so uvicorn's plain-text lines do not publish zeros. The six filters are:
+Each `/predict` call prints one JSON object to that stream. A **metric filter** is a rule on the log group: when a line matches, CloudWatch adds 1 to a metric in the `FraudApi/${Environment}` namespace. The `prod` stack publishes to `FraudApi/prod`. The filters do not set a default value, so uvicorn's plain-text lines do not publish zeros. The six filters are:
 
 | Filter | Metric | Matches |
 |---|---|---|
@@ -241,7 +242,7 @@ Outputs are the values CloudFormation prints on the stack's Outputs tab after th
 | `InstanceId` | The EC2 id, such as `i-0abc123`. | The console, the alarms, and the AWS CLI all refer to the machine by this id. You need it to stop the instance, open a Session Manager shell, or check why the stack is still waiting on the boot signal. |
 | `PublicIp` | The public IPv4 address of that machine. | This is the address of the server on the internet. SSH uses it (`ec2-user@<public-ip>`). It can change if the instance is stopped and started again, and it changes when a template update replaces the instance. |
 | `PredictUrl` | `http://<public-ip>:8000/predict` | This is the fraud API. A client POSTs a JSON body of features here and gets a prediction back. It is the address you give to a notebook, a test script, or another service. |
-| `LogGroupName` | `/fraud-detection/api` | Container stdout and stderr go here, in a stream named `fraud-api`. Open this log group in CloudWatch when a request fails or the process crashes. The group is kept for 30 days. |
+| `LogGroupName` | `/fraud-detection/<environment>/api`, such as `/fraud-detection/prod/api` | Container stdout and stderr go here, in a stream named `fraud-api`. Open this log group in CloudWatch when a request fails or the process crashes. The group is kept for 30 days. |
 | `AlarmTopicArn` | The ARN of the SNS topic, such as `arn:aws:sns:eu-central-1:511743255923:my-stack-fraud-api-alarms`. | CPU, status-check, and server-error alarms publish to this topic. Use the ARN to add another subscriber later, such as a second email or a chat webhook, without editing the alarms. |
 | `DashboardName` | The CloudWatch dashboard name, such as `my-stack-fraud-api`. | One page with request volume, failures, error categories, host health, and the latest API logs. Search this name in CloudWatch dashboards instead of building the graphs yourself. |
 | `PredictionsBucketName` | The generated bucket name. | Where the JSON prediction records are. Use it with the AWS CLI or a later analysis job. The instance can only write under `predictions/`. |
@@ -264,7 +265,7 @@ Short meanings for the acronyms in this guide and in `fraud-api.yaml`. Each one 
 |---|---|---|
 | AMI | Amazon Machine Image | The disk image the instance boots from. Here it is Amazon Linux 2023, looked up at deploy time so the id does not go stale. |
 | API | Application programming interface | The program clients call. This one listens on port 8000 and accepts a POST at `/predict`. |
-| ARN | Amazon Resource Name | The unique address of one AWS object, used in the IAM policy and printed for the alarm topic. Example: `arn:aws:logs:eu-central-1:123456789012:log-group:/fraud-detection/api`. |
+| ARN | Amazon Resource Name | The unique address of one AWS object, used in the IAM policy and printed for the alarm topic. Example: `arn:aws:logs:eu-central-1:123456789012:log-group:/fraud-detection/prod/api`. |
 | AWS | Amazon Web Services | The cloud these resources run in: the machine, the logs, the alarms, the bucket, and the secret. |
 | CIDR | Classless Inter-Domain Routing | A way to write a range of IP addresses. `203.0.113.4/32` is one address. `0.0.0.0/0` is every address. `SSHLocation` and `ApiAllowedCidr` use this form. |
 | CI | Continuous integration | The pipeline that builds and publishes the Docker image tags `dev`, `stg`, `sha-<commit>`, and `prod`. |

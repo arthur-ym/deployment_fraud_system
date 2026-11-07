@@ -59,6 +59,16 @@ Parameters:
     MaxValue: 3650
     Description: Days to keep prediction objects before S3 expires them.
 
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - stg
+      - prod
+    Description: >-
+      Deployment environment. Separates this stack's CloudWatch log group,
+      metrics, and dashboard from the other environments.
+
 Conditions:
   HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
 
@@ -130,7 +140,7 @@ Resources:
   FraudApiLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: /fraud-detection/api
+      LogGroupName: !Sub "/fraud-detection/${Environment}/api"
       RetentionInDays: 30
 
   FraudApiPredictionsBucket:
@@ -273,7 +283,7 @@ Resources:
             --restart unless-stopped \
             --log-driver=awslogs \
             --log-opt awslogs-region=${AWS::Region} \
-            --log-opt awslogs-group=/fraud-detection/api \
+            --log-opt awslogs-group=/fraud-detection/${Environment}/api \
             --log-opt awslogs-stream=fraud-api \
             --log-opt awslogs-create-group=false \
             -e PREDICTIONS_BUCKET=${FraudApiPredictionsBucket} \
@@ -341,7 +351,7 @@ Resources:
       FilterPattern: '{ $.event = "request" }'
       MetricTransformations:
         - MetricName: RequestCount
-          MetricNamespace: FraudApi
+          MetricNamespace: !Sub "FraudApi/${Environment}"
           MetricValue: "1"
           Unit: Count
 
@@ -352,7 +362,7 @@ Resources:
       FilterPattern: '{ $.event = "request" && $.http_status >= 400 && $.http_status <= 499 }'
       MetricTransformations:
         - MetricName: ClientErrorCount
-          MetricNamespace: FraudApi
+          MetricNamespace: !Sub "FraudApi/${Environment}"
           MetricValue: "1"
           Unit: Count
 
@@ -363,7 +373,7 @@ Resources:
       FilterPattern: '{ $.event = "request" && $.http_status >= 500 && $.http_status <= 599 }'
       MetricTransformations:
         - MetricName: ServerErrorCount
-          MetricNamespace: FraudApi
+          MetricNamespace: !Sub "FraudApi/${Environment}"
           MetricValue: "1"
           Unit: Count
 
@@ -374,7 +384,7 @@ Resources:
       FilterPattern: '{ $.event = "request" && $.error_category = "invalid_features" }'
       MetricTransformations:
         - MetricName: InvalidFeaturesCount
-          MetricNamespace: FraudApi
+          MetricNamespace: !Sub "FraudApi/${Environment}"
           MetricValue: "1"
           Unit: Count
 
@@ -385,7 +395,7 @@ Resources:
       FilterPattern: '{ $.event = "request" && $.error_category = "model_error" }'
       MetricTransformations:
         - MetricName: ModelErrorCount
-          MetricNamespace: FraudApi
+          MetricNamespace: !Sub "FraudApi/${Environment}"
           MetricValue: "1"
           Unit: Count
 
@@ -396,7 +406,7 @@ Resources:
       FilterPattern: '{ $.event = "request" && $.error_category = "exception" }'
       MetricTransformations:
         - MetricName: ExceptionCount
-          MetricNamespace: FraudApi
+          MetricNamespace: !Sub "FraudApi/${Environment}"
           MetricValue: "1"
           Unit: Count
 
@@ -405,7 +415,7 @@ Resources:
     Properties:
       AlarmName: !Sub "${AWS::StackName}-server-errors"
       AlarmDescription: Fraud API returned at least one HTTP 5xx response in five minutes.
-      Namespace: FraudApi
+      Namespace: !Sub "FraudApi/${Environment}"
       MetricName: ServerErrorCount
       Statistic: Sum
       Period: 300
@@ -436,7 +446,7 @@ Resources:
                 "stat": "Sum",
                 "period": 3600,
                 "metrics": [
-                  ["FraudApi", "RequestCount", {"label": "Requests"}]
+                  ["FraudApi/${Environment}", "RequestCount", {"label": "Requests"}]
                 ]
               }
             },
@@ -453,8 +463,8 @@ Resources:
                 "stat": "Sum",
                 "period": 3600,
                 "metrics": [
-                  ["FraudApi", "ClientErrorCount", {"label": "HTTP 4xx"}],
-                  ["FraudApi", "ServerErrorCount", {"label": "HTTP 5xx"}]
+                  ["FraudApi/${Environment}", "ClientErrorCount", {"label": "HTTP 4xx"}],
+                  ["FraudApi/${Environment}", "ServerErrorCount", {"label": "HTTP 5xx"}]
                 ]
               }
             },
@@ -471,9 +481,9 @@ Resources:
                 "period": 3600,
                 "yAxis": {"left": {"min": 0, "max": 100, "label": "%"}},
                 "metrics": [
-                  ["FraudApi", "ClientErrorCount", {"id": "c", "stat": "Sum", "visible": false}],
-                  ["FraudApi", "ServerErrorCount", {"id": "s", "stat": "Sum", "visible": false}],
-                  ["FraudApi", "RequestCount", {"id": "r", "stat": "Sum", "visible": false}],
+                  ["FraudApi/${Environment}", "ClientErrorCount", {"id": "c", "stat": "Sum", "visible": false}],
+                  ["FraudApi/${Environment}", "ServerErrorCount", {"id": "s", "stat": "Sum", "visible": false}],
+                  ["FraudApi/${Environment}", "RequestCount", {"id": "r", "stat": "Sum", "visible": false}],
                   [{"expression": "IF(r>0,100*(c+s)/r,0)", "label": "Failed requests %", "id": "rate"}]
                 ]
               }
@@ -491,9 +501,9 @@ Resources:
                 "stat": "Sum",
                 "period": 3600,
                 "metrics": [
-                  ["FraudApi", "InvalidFeaturesCount", {"label": "Invalid or missing features"}],
-                  ["FraudApi", "ModelErrorCount", {"label": "Model errors"}],
-                  ["FraudApi", "ExceptionCount", {"label": "Exceptions"}]
+                  ["FraudApi/${Environment}", "InvalidFeaturesCount", {"label": "Invalid or missing features"}],
+                  ["FraudApi/${Environment}", "ModelErrorCount", {"label": "Model errors"}],
+                  ["FraudApi/${Environment}", "ExceptionCount", {"label": "Exceptions"}]
                 ]
               }
             },
@@ -561,7 +571,7 @@ Resources:
               "properties": {
                 "title": "API logs",
                 "region": "${AWS::Region}",
-                "query": "SOURCE '/fraud-detection/api' | filter event = \"request\" | fields @timestamp, request_id, http_status, duration_ms, error_category, error_message | sort @timestamp desc | limit 50",
+                "query": "SOURCE '/fraud-detection/${Environment}/api' | filter event = \"request\" | fields @timestamp, request_id, http_status, duration_ms, error_category, error_message | sort @timestamp desc | limit 50",
                 "view": "table"
               }
             }
