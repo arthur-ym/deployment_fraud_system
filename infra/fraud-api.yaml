@@ -240,19 +240,19 @@ Resources:
           dnf install -y docker jq aws-cfn-bootstrap
           systemctl enable --now docker
 
-          on_error() {
+          cat > /usr/local/bin/start-fraud-api.sh << 'EOF'
+          #!/bin/bash
+          set -euo pipefail
+
+          cleanup() {
             unset DOCKER_USER DOCKER_TOKEN || true
             rm -f /tmp/docker-secret.json
             docker logout >/dev/null 2>&1 || true
             rm -f /root/.docker/config.json
-            /opt/aws/bin/cfn-signal -e 1 \
-              --stack ${AWS::StackName} \
-              --resource FraudApiInstance \
-              --region ${AWS::Region} || true
           }
-          trap on_error ERR
+          trap cleanup EXIT
 
-          # xtrace would write the token into /var/log/cloud-init-output.log
+          # xtrace would write the token into the command log
           set +x
           umask 077
           aws secretsmanager get-secret-value \
@@ -273,9 +273,6 @@ Resources:
           set -x
 
           docker pull "${DockerImage}"
-          rm -f /tmp/docker-secret.json
-          docker logout
-          rm -f /root/.docker/config.json
 
           docker rm -f fraud-detection-api >/dev/null 2>&1 || true
           docker run -d \
@@ -299,12 +296,36 @@ Resources:
             sleep 5
           done
           test "$(docker inspect -f '{{.State.Running}}' fraud-detection-api)" = "true"
+          EOF
+          chmod 755 /usr/local/bin/start-fraud-api.sh
 
+          on_error() {
+            /opt/aws/bin/cfn-signal -e 1 \
+              --stack ${AWS::StackName} \
+              --resource FraudApiInstance \
+              --region ${AWS::Region} || true
+          }
+          trap on_error ERR
+          /usr/local/bin/start-fraud-api.sh
           trap - ERR
           /opt/aws/bin/cfn-signal -e 0 \
             --stack ${AWS::StackName} \
             --resource FraudApiInstance \
             --region ${AWS::Region}
+
+  FraudApiEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-fraud-api"
+
+  FraudApiEipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt FraudApiEip.AllocationId
+      InstanceId: !Ref FraudApiInstance
 
   FraudApiCpuAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -584,12 +605,12 @@ Outputs:
     Value: !Ref FraudApiInstance
 
   PublicIp:
-    Description: Public IPv4 address
-    Value: !GetAtt FraudApiInstance.PublicIp
+    Description: Elastic IP address of the fraud API
+    Value: !Ref FraudApiEip
 
   PredictUrl:
     Description: POST JSON features to this URL
-    Value: !Sub "http://${FraudApiInstance.PublicIp}:8000/predict"
+    Value: !Sub "http://${FraudApiEip}:8000/predict"
 
   LogGroupName:
     Description: CloudWatch log group. The container writes the fraud-api stream.
