@@ -152,7 +152,7 @@ The failure rate is metric math, not a stored metric: `100 * (client errors + se
 
 ### Predictions bucket
 
-`FraudApiPredictionsBucket` is a private S3 bucket. CloudFormation generates the name, so it is unique to this stack and stays lowercase. The bucket has four protections:
+`FraudApiPredictionsBucket` is a private S3 bucket named `fraud-api-<environment>-predictions`, for example `fraud-api-dev-predictions`. If that bucket is already in the account, the deploy keeps it and refreshes the settings below. A bucket cannot be renamed, so this does not adopt an older bucket whose name still ends in the account id. The bucket has four protections:
 
 - **Block Public Access** is on. These four switches (`BlockPublicAcls`, `BlockPublicPolicy`, `IgnorePublicAcls`, `RestrictPublicBuckets`) stop a public ACL or a public bucket policy from exposing the files.
 - Object ownership is `BucketOwnerEnforced`, so ACLs are disabled and the bucket owner owns every object.
@@ -252,7 +252,7 @@ Outputs are the values CloudFormation prints on the stack's Outputs tab after th
 | `LogGroupName` | `/fraud-detection/<environment>/api`, such as `/fraud-detection/prod/api` | Container stdout and stderr go here, in a stream named `fraud-api`. Open this log group in CloudWatch when a request fails or the process crashes. The group is kept for 30 days. |
 | `AlarmTopicArn` | The ARN of the SNS topic, such as `arn:aws:sns:eu-central-1:511743255923:my-stack-fraud-api-alarms`. | CPU, status-check, and server-error alarms publish to this topic. Use the ARN to add another subscriber later, such as a second email or a chat webhook, without editing the alarms. |
 | `DashboardName` | The CloudWatch dashboard name, such as `my-stack-fraud-api`. | One page with request volume, failures, error categories, host health, and the latest API logs. Search this name in CloudWatch dashboards instead of building the graphs yourself. |
-| `PredictionsBucketName` | The generated bucket name. | Where the JSON prediction records are. Use it with the AWS CLI or a later analysis job. The instance can only write under `predictions/`. |
+| `PredictionsBucketName` | `fraud-api-<environment>-predictions` | Where the JSON prediction records are. Use it with the AWS CLI or a later analysis job. The instance can only write under `predictions/`. |
 
 ## What must exist before a deploy
 
