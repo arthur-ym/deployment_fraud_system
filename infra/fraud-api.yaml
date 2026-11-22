@@ -168,9 +168,9 @@ Resources:
               - Sid: ConfigurePredictionsBucket
                 Effect: Allow
                 Action:
-                  - s3:HeadBucket
+                  - s3:ListBucket
                   - s3:GetBucketLocation
-                  - s3:PutBucketEncryption
+                  - s3:PutEncryptionConfiguration
                   - s3:PutBucketPublicAccessBlock
                   - s3:PutBucketOwnershipControls
                   - s3:PutLifecycleConfiguration
@@ -330,9 +330,7 @@ Resources:
 
   FraudApiInstance:
     Type: AWS::EC2::Instance
-    DependsOn:
-      - FraudApiLogGroup
-      - FraudApiPredictionsBucket
+    DependsOn: FraudApiLogGroup
     CreationPolicy:
       ResourceSignal:
         Count: 1
