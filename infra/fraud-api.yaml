@@ -66,8 +66,9 @@ Parameters:
       - stg
       - prod
     Description: >-
-      Deployment environment. Separates this stack's CloudWatch log group,
-      metrics, and dashboard from the other environments.
+      Deployment environment. Selects the predictions bucket and separates
+      this stack's CloudWatch log group, metrics, and dashboard from the
+      other environments.
 
 Conditions:
   HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
@@ -145,7 +146,10 @@ Resources:
 
   FraudApiPredictionsBucket:
     Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
+      BucketName: !Sub "fraud-api-${Environment}-predictions-${AWS::AccountId}"
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -168,7 +172,9 @@ Resources:
               DaysAfterInitiation: 7
       Tags:
         - Key: Name
-          Value: !Sub "${AWS::StackName}-predictions"
+          Value: !Sub "fraud-api-${Environment}-predictions"
+        - Key: Environment
+          Value: !Ref Environment
 
   FraudApiPredictionsBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -625,5 +631,7 @@ Outputs:
     Value: !Ref FraudApiDashboard
 
   PredictionsBucketName:
-    Description: Private S3 bucket that stores one JSON object per prediction
+    Description: >-
+      Private S3 bucket for this environment. The name is stable across stack
+      updates, so a new stack deploy keeps writing to the same bucket.
     Value: !Ref FraudApiPredictionsBucket
