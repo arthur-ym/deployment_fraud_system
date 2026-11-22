@@ -144,37 +144,158 @@ Resources:
       LogGroupName: !Sub "/fraud-detection/${Environment}/api"
       RetentionInDays: 30
 
+  FraudApiPredictionsBucketFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EnsurePredictionsBucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CreatePredictionsBucket
+                Effect: Allow
+                Action: s3:CreateBucket
+                Resource: "*"
+              - Sid: ConfigurePredictionsBucket
+                Effect: Allow
+                Action:
+                  - s3:HeadBucket
+                  - s3:GetBucketLocation
+                  - s3:PutBucketEncryption
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:PutBucketOwnershipControls
+                  - s3:PutLifecycleConfiguration
+                  - s3:PutBucketTagging
+                Resource: !Sub "arn:aws:s3:::fraud-api-${Environment}-predictions"
+
+  FraudApiPredictionsBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt FraudApiPredictionsBucketFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+          from botocore.exceptions import ClientError
+
+          def send(event, context, status, data, physical_id, reason=None):
+              body = {
+                  "Status": status,
+                  "Reason": reason or "See the CloudWatch log stream for this function",
+                  "PhysicalResourceId": physical_id,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "NoEcho": False,
+                  "Data": data,
+              }
+              request = urllib.request.Request(
+                  event["ResponseURL"],
+                  data=json.dumps(body).encode(),
+                  method="PUT",
+              )
+              request.add_header("Content-Type", "")
+              with urllib.request.urlopen(request) as response:
+                  response.read()
+
+          def bucket_exists(s3, name):
+              try:
+                  s3.head_bucket(Bucket=name)
+                  return True
+              except ClientError as error:
+                  status = error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+                  code = error.response.get("Error", {}).get("Code", "")
+                  if status == 404 or code in ("404", "NoSuchBucket", "NotFound"):
+                      return False
+                  raise
+
+          def ensure_bucket(props):
+              name = props["BucketName"]
+              region = props["Region"]
+              s3 = boto3.client("s3", region_name=region)
+              if not bucket_exists(s3, name):
+                  kwargs = {"Bucket": name}
+                  if region != "us-east-1":
+                      kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
+                  try:
+                      s3.create_bucket(**kwargs)
+                  except ClientError as error:
+                      if error.response.get("Error", {}).get("Code") != "BucketAlreadyOwnedByYou":
+                          raise
+              s3.put_public_access_block(
+                  Bucket=name,
+                  PublicAccessBlockConfiguration={
+                      "BlockPublicAcls": True,
+                      "IgnorePublicAcls": True,
+                      "BlockPublicPolicy": True,
+                      "RestrictPublicBuckets": True,
+                  },
+              )
+              s3.put_bucket_ownership_controls(
+                  Bucket=name,
+                  OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]},
+              )
+              s3.put_bucket_encryption(
+                  Bucket=name,
+                  ServerSideEncryptionConfiguration={
+                      "Rules": [{
+                          "ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"},
+                      }]
+                  },
+              )
+              s3.put_bucket_lifecycle_configuration(
+                  Bucket=name,
+                  LifecycleConfiguration={
+                      "Rules": [{
+                          "ID": "ExpirePredictions",
+                          "Status": "Enabled",
+                          "Filter": {"Prefix": "predictions/"},
+                          "Expiration": {"Days": int(props["RetentionDays"])},
+                          "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7},
+                      }]
+                  },
+              )
+              s3.put_bucket_tagging(
+                  Bucket=name,
+                  Tagging={"TagSet": [
+                      {"Key": "Name", "Value": name},
+                      {"Key": "Environment", "Value": props["EnvironmentName"]},
+                  ]},
+              )
+
+          def handler(event, context):
+              name = event["ResourceProperties"]["BucketName"]
+              data = {"BucketName": name, "Arn": f"arn:aws:s3:::{name}"}
+              try:
+                  if event["RequestType"] != "Delete":
+                      ensure_bucket(event["ResourceProperties"])
+                  send(event, context, "SUCCESS", data, name)
+              except Exception as error:
+                  send(event, context, "FAILED", {}, name, reason=str(error)[:1000])
+
   FraudApiPredictionsBucket:
-    Type: AWS::S3::Bucket
+    Type: AWS::CloudFormation::CustomResource
     DeletionPolicy: Retain
     UpdateReplacePolicy: Retain
     Properties:
-      BucketName: !Sub "fraud-api-${Environment}-predictions-${AWS::AccountId}"
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      OwnershipControls:
-        Rules:
-          - ObjectOwnership: BucketOwnerEnforced
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      LifecycleConfiguration:
-        Rules:
-          - Id: ExpirePredictions
-            Status: Enabled
-            Prefix: predictions/
-            ExpirationInDays: !Ref PredictionRetentionDays
-            AbortIncompleteMultipartUpload:
-              DaysAfterInitiation: 7
-      Tags:
-        - Key: Name
-          Value: !Sub "fraud-api-${Environment}-predictions"
-        - Key: Environment
-          Value: !Ref Environment
+      ServiceToken: !GetAtt FraudApiPredictionsBucketFunction.Arn
+      BucketName: !Sub "fraud-api-${Environment}-predictions"
+      Region: !Ref AWS::Region
+      EnvironmentName: !Ref Environment
+      RetentionDays: !Ref PredictionRetentionDays
 
   FraudApiPredictionsBucketPolicy:
     Type: AWS::S3::BucketPolicy
@@ -209,7 +330,9 @@ Resources:
 
   FraudApiInstance:
     Type: AWS::EC2::Instance
-    DependsOn: FraudApiLogGroup
+    DependsOn:
+      - FraudApiLogGroup
+      - FraudApiPredictionsBucket
     CreationPolicy:
       ResourceSignal:
         Count: 1
@@ -632,6 +755,6 @@ Outputs:
 
   PredictionsBucketName:
     Description: >-
-      Private S3 bucket for this environment. The name is stable across stack
-      updates, so a new stack deploy keeps writing to the same bucket.
+      Private bucket fraud-api-<environment>-predictions. A later deploy keeps
+      this bucket when it already exists.
     Value: !Ref FraudApiPredictionsBucket
